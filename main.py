@@ -12,7 +12,20 @@ from transformers import SegformerImageProcessor, AutoModelForSemanticSegmentati
 from sklearn.cluster import KMeans
 from skimage import color
 
+
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(title="Uniform Segmentation & Static Comparison API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 
 # --------------------- MODEL SETUP ---------------------
 _model: Optional[AutoModelForSemanticSegmentation] = None
