@@ -33,11 +33,6 @@ _model: Optional[AutoModelForSemanticSegmentation] = None
 _processor: Optional[SegformerImageProcessor] = None
 
 def get_device() -> torch.device:
-    """Select best available compute device."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():  # Apple Silicon
-        return torch.device("mps")
     return torch.device("cpu")
 
 def load_model_if_needed() -> None:
