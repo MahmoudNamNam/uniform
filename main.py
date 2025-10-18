@@ -16,11 +16,11 @@ from skimage import color
 # ---------------------------------------------------------
 # APP INITIALIZATION + CORS
 # ---------------------------------------------------------
-app = FastAPI(title="Uniform Segmentation & Static Comparison API")
+app = FastAPI(title="Uniform Segmentation & Static Comparison API (Optimized CPU)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change to your frontend URL(s) in production
+    allow_origins=["*"],  # Change to your frontend domain in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,17 +33,23 @@ _model: Optional[AutoModelForSemanticSegmentation] = None
 _processor: Optional[SegformerImageProcessor] = None
 
 def get_device() -> torch.device:
+    """Force model to use CPU only."""
     return torch.device("cpu")
 
 def load_model_if_needed() -> None:
-    """Lazy-load SegFormer model."""
+    """Lazy-load smaller and quantized SegFormer model."""
     global _model, _processor
     if _model is None or _processor is None:
-        model_name = "mattmdjaga/segformer_b2_clothes"
+        model_name = "mattmdjaga/segformer_b0_clothes"  # Smaller version
         _processor = SegformerImageProcessor.from_pretrained(model_name)
         _model = AutoModelForSemanticSegmentation.from_pretrained(model_name)
-        _model.to(get_device())
-        _model.eval()
+
+        # Dynamic quantization for smaller memory footprint
+        _model = torch.quantization.quantize_dynamic(
+            _model, {torch.nn.Linear}, dtype=torch.qint8
+        )
+
+        _model.to("cpu").eval()
 
 def logits_to_label_ids(logits: torch.Tensor, target_size: tuple[int, int]) -> torch.Tensor:
     """Resizes logits and returns argmax label IDs."""
@@ -56,20 +62,34 @@ def logits_to_label_ids(logits: torch.Tensor, target_size: tuple[int, int]) -> t
 # ---------------------------------------------------------
 KEEP_CLASSES = [4, 5, 6, 7, 8]  # dress, coat, shirt, pants, skirt
 
+def preprocess_image(img: Image.Image, max_size: int = 512) -> Image.Image:
+    """Resize large images to reduce memory use."""
+    img = img.convert("RGB")
+    img.thumbnail((max_size, max_size))
+    return img
+
 def inference_model(img: Image.Image) -> torch.Tensor:
     """Runs inference and returns class ID mask."""
     load_model_if_needed()
     device = get_device()
+
     inputs = _processor(images=img, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
     with torch.no_grad():
         outputs = _model(**inputs)
         logits = outputs.logits
-    return logits_to_label_ids(logits, img.size[::-1])
+
+    label_ids = logits_to_label_ids(logits, img.size[::-1])
+
+    # Explicit cleanup
+    del inputs, outputs, logits
+    torch.cuda.empty_cache()  # Safe on CPU
+
+    return label_ids
 
 def extract_color_features(image: np.ndarray, mask: np.ndarray, keep_classes=KEEP_CLASSES, k=2):
-    """Extracts LAB median colors for visible clothing regions."""
+    """Extract LAB median colors for visible clothing regions."""
     features = {}
     found = 0
     for cls in keep_classes:
@@ -132,13 +152,13 @@ async def compare_static_reference(
         if not os.path.exists(ref_path):
             raise HTTPException(status_code=404, detail=f"Reference image not found at {ref_path}")
 
-        ref_img = Image.open(ref_path).convert("RGB")
-        test_img = Image.open(io.BytesIO(await test_image.read())).convert("RGB")
+        # Preprocess images
+        ref_img = preprocess_image(Image.open(ref_path))
+        test_img = preprocess_image(Image.open(io.BytesIO(await test_image.read())))
 
         # Run segmentation
         ref_mask = inference_model(ref_img)
         test_mask = inference_model(test_img)
-
 
         # Extract color features
         ref_feat = extract_color_features(np.array(ref_img), ref_mask.numpy())
