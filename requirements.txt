@@ -1,0 +1,8 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+torch>=2.0.0
+transformers>=4.52.0
+scikit-image
+scikit-learn
+Pillow
+numpy
