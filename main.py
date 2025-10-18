@@ -5,6 +5,7 @@ from typing import Optional
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import torch
 import torch.nn.functional as F
@@ -12,37 +13,35 @@ from transformers import SegformerImageProcessor, AutoModelForSemanticSegmentati
 from sklearn.cluster import KMeans
 from skimage import color
 
-
-from fastapi.middleware.cors import CORSMiddleware
-
+# ---------------------------------------------------------
+# APP INITIALIZATION + CORS
+# ---------------------------------------------------------
 app = FastAPI(title="Uniform Segmentation & Static Comparison API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],  # Change to your frontend URL(s) in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-
-# --------------------- MODEL SETUP ---------------------
+# ---------------------------------------------------------
+# MODEL SETUP
+# ---------------------------------------------------------
 _model: Optional[AutoModelForSemanticSegmentation] = None
 _processor: Optional[SegformerImageProcessor] = None
-
 
 def get_device() -> torch.device:
     """Select best available compute device."""
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():  # Apple Silicon (M1/M2)
+    if torch.backends.mps.is_available():  # Apple Silicon
         return torch.device("mps")
     return torch.device("cpu")
 
-
 def load_model_if_needed() -> None:
-    """Lazy-loads the SegFormer model and processor."""
+    """Lazy-load SegFormer model."""
     global _model, _processor
     if _model is None or _processor is None:
         model_name = "mattmdjaga/segformer_b2_clothes"
@@ -51,17 +50,16 @@ def load_model_if_needed() -> None:
         _model.to(get_device())
         _model.eval()
 
-
 def logits_to_label_ids(logits: torch.Tensor, target_size: tuple[int, int]) -> torch.Tensor:
-    """Resizes segmentation logits and returns argmax label IDs."""
-    upsampled_logits = F.interpolate(logits, size=target_size, mode="bilinear", align_corners=False)
-    label_ids = upsampled_logits.argmax(dim=1)
+    """Resizes logits and returns argmax label IDs."""
+    upsampled = F.interpolate(logits, size=target_size, mode="bilinear", align_corners=False)
+    label_ids = upsampled.argmax(dim=1)
     return label_ids.squeeze(0).to("cpu")
 
-
-# --------------------- FEATURE EXTRACTION ---------------------
-KEEP_CLASSES = [4, 6]  # 4 = upper clothes, 6 = pants
-
+# ---------------------------------------------------------
+# FEATURE EXTRACTION
+# ---------------------------------------------------------
+KEEP_CLASSES = [4, 5, 6, 7, 8]  # dress, coat, shirt, pants, skirt
 
 def inference_model(img: Image.Image) -> torch.Tensor:
     """Runs inference and returns class ID mask."""
@@ -75,27 +73,26 @@ def inference_model(img: Image.Image) -> torch.Tensor:
         logits = outputs.logits
     return logits_to_label_ids(logits, img.size[::-1])
 
-
 def extract_color_features(image: np.ndarray, mask: np.ndarray, keep_classes=KEEP_CLASSES, k=2):
-    """Extracts median LAB color + dominant color ratio for shirt/pants."""
+    """Extracts LAB median colors for visible clothing regions."""
     features = {}
-    for cls, name in zip(keep_classes, ["upper", "lower"]):
-        region_pixels = image[mask == cls]
-        if len(region_pixels) == 0:
-            features[f"{name}_median"] = None
-            features[f"{name}_dominant_ratio"] = 0
+    found = 0
+    for cls in keep_classes:
+        region = image[mask == cls]
+        if len(region) == 0:
             continue
-
-        lab_pixels = color.rgb2lab(region_pixels.reshape(-1, 3).astype(np.float32) / 255.0)
+        found += 1
+        lab_pixels = color.rgb2lab(region.reshape(-1, 3).astype(np.float32) / 255.0)
         median_lab = np.median(lab_pixels, axis=0).flatten()
-        features[f"{name}_median"] = median_lab
-
+        features[f"class_{cls}_median"] = median_lab
+        # Dominant color ratio
         km = KMeans(n_clusters=k, n_init=3).fit(lab_pixels)
         counts = np.bincount(km.labels_)
         dominant_ratio = counts.max() / counts.sum()
-        features[f"{name}_dominant_ratio"] = dominant_ratio
+        features[f"class_{cls}_dominant_ratio"] = dominant_ratio
+    if found == 0:
+        return None
     return features
-
 
 def deltaE(lab1, lab2):
     """Computes perceptual color distance (CIEDE2000)."""
@@ -103,44 +100,39 @@ def deltaE(lab1, lab2):
         return np.inf
     return color.deltaE_ciede2000(lab1.reshape(1, 3), lab2.reshape(1, 3))[0]
 
-
 def compare_features(featA, featB):
     """Computes similarity score between two color feature sets."""
-    top_diff = deltaE(featA["upper_median"], featB["upper_median"])
-    bottom_diff = deltaE(featA["lower_median"], featB["lower_median"])
-    top_bottom_diff = deltaE(featA["upper_median"], featB["lower_median"])
-    bottom_top_diff = deltaE(featA["lower_median"], featB["upper_median"])
-    same_dress_diff = deltaE(featA["upper_median"], featA["lower_median"])
+    if featA is None or featB is None:
+        return 0.0
 
-    final_score = (
-        10 * top_diff
-        + 10 * bottom_diff
-        + 5 * top_bottom_diff
-        + 5 * bottom_top_diff
-        + 5 * same_dress_diff
-    ) / 35
+    common = set(featA.keys()) & set(featB.keys())
+    common = [k for k in common if k.endswith("_median")]
+    if not common:
+        return 0.0
 
-    similarity = max(0, min(1.0, 1.5 - final_score / 10))
+    diffs = [deltaE(featA[k], featB[k]) for k in common]
+    mean_diff = np.mean(diffs)
+    similarity = max(0.0, min(1.0, 1.5 - mean_diff / 10))
     return similarity
 
-
-# --------------------- ENDPOINTS ---------------------
+# ---------------------------------------------------------
+# API ENDPOINTS
+# ---------------------------------------------------------
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
-
 
 @app.post("/compare")
 async def compare_static_reference(
     test_image: UploadFile = File(..., description="Image to compare against static reference"),
 ):
     """
-    Compare uploaded uniform image against a static reference (ref.jpg) in project root.
+    Compare uploaded uniform image against static reference (ref-2.jpg).
     """
     try:
         load_model_if_needed()
 
-        # Load static reference
+        # Static reference path
         ref_path = "./ref-2.jpg"
         if not os.path.exists(ref_path):
             raise HTTPException(status_code=404, detail=f"Reference image not found at {ref_path}")
@@ -151,6 +143,7 @@ async def compare_static_reference(
         # Run segmentation
         ref_mask = inference_model(ref_img)
         test_mask = inference_model(test_img)
+
 
         # Extract color features
         ref_feat = extract_color_features(np.array(ref_img), ref_mask.numpy())
@@ -167,4 +160,3 @@ async def compare_static_reference(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Comparison failed: {str(e)}")
-
